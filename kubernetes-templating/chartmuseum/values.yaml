@@ -1,0 +1,79 @@
+ingress:
+  enabled: true
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    kubernetes.io/tls-acme: "true"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    cert-manager.io/acme-challenge-type: http01
+  hosts:
+    - name: chartmuseum.34.159.243.248.nip.io
+      path: /
+      tls: true
+      tlsSecret: chartmuseum.34.159.243.248.nip.io
+env:
+  open:
+    # storage backend, can be one of: local, alibaba, amazon, google, microsoft, oracle
+    STORAGE: local
+  #   # gcs bucket to store charts for google storage backend
+  #   STORAGE_GOOGLE_BUCKET: infra-bucket777
+  #   # prefix to store charts for google storage backend
+  #   STORAGE_GOOGLE_PREFIX: ""
+  #   # container to store charts for microsoft storage backend
+  #   CHART_POST_FORM_FIELD_NAME: chart
+  #   # form field which will be queried for the provenance file content
+  #   PROV_POST_FORM_FIELD_NAME: prov
+  #   # levels of nested repos for multitenancy. The default depth is 0 (singletenant server)
+  #   DEPTH: 0
+  #   # show debug messages
+  #   DEBUG: true
+  #   # output structured logs as json
+  #   LOG_JSON: true
+  #   # disable use of index-cache.yaml
+  #   DISABLE_STATEFILES: false
+  #   # disable Prometheus metrics
+  #   DISABLE_METRICS: true
+  #   # disable all routes prefixed with /api
+  #   DISABLE_API: true
+  #   # allow chart versions to be re-uploaded
+  #   ALLOW_OVERWRITE: false
+  #   # absolute url for .tgzs in index.yaml
+  #   CHART_URL:
+  #   # allow anonymous GET operations when auth is used
+  #   AUTH_ANONYMOUS_GET: false
+  #   # sets the base context path
+  #   CONTEXT_PATH:
+  #   # parallel scan limit for the repo indexer
+  #   INDEX_LIMIT: 0
+  #   # cache store, can be one of: redis (leave blank for inmemory cache)
+  #   CACHE:
+  #   # address of Redis service (host:port)
+  #   CACHE_REDIS_ADDR:
+  #   # Redis database to be selected after connect
+  #   CACHE_REDIS_DB: 0
+  #   # enable bearer auth
+  #   BEARER_AUTH: false
+  #   # auth realm used for bearer auth
+  #   AUTH_REALM:
+  #   # auth service used for bearer auth
+  #   AUTH_SERVICE:
+  # # field:
+  # #   # POD_IP: status.podIP
+  # secret:
+  # #   # username for basic http authentication
+  # #   BASIC_AUTH_USER: admin
+  # #   # password for basic http authentication
+  # #   BASIC_AUTH_PASS: password
+  # #   # GCP service account json file
+  # #   # Redis requirepass server configuration
+  # #   CACHE_REDIS_PASSWORD:
+  # # # Name of an existing secret to get the secret values ftom
+  # # existingSecret:
+  # # # Stores Enviromnt Variable to secret key name mappings
+  # existingSecretMappings:
+  # #   # username for basic http authentication
+  # #   BASIC_AUTH_USER: admin
+  # #   # password for basic http authentication
+  # #   BASIC_AUTH_PASS: password
+  # #   # GCP service account json file
+  # #   # Redis requirepass server configuration
+  # #   CACHE_REDIS_PASSWORD:
