@@ -1,0 +1,8 @@
+ui:
+  enabled: true
+  serviceType: "ClusterIP"
+server:
+  standalone:
+    enabled: false
+  ha:
+    enabled: true
