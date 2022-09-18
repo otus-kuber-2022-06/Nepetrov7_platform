@@ -911,3 +911,367 @@ revocation_time_rfc3339    2022-04-21T09:18:47.738629201Z
 ```
 - документация для настройки vault по https: `https://www.vaultproject.io/docs/platform/k8s/helm/examples/standalone-tls`
 - документация по autounseal: `https://www.vaultproject.io/docs/configuration/seal`
+
+## gitops
+- готовим репозиторий
+```
+git clone https://github.com/GoogleCloudPlatform/microservices-demo
+cd microservices-demo
+git remote add gitlab git@gitlab.com:otus-petrov/microservices-demo.git
+git remote remove origin
+git push gitlab master
+```
+- пишем чарты для всех приложений
+- помещаем в `deploy/charts`
+- разворачиваем кластер из 4 нод на yandex.cloud
+- устанавливаем istio в кластер
+
+```
+helm repo add istio https://istio-release.storage.googleapis.com/charts
+helm repo update
+kubectl create namespace istio-system
+helm install istio-base istio/base -n istio-system
+helm install istiod istio/istiod -n istio-system --wait
+kubectl create namespace istio-ingress
+kubectl label namespace istio-ingress istio-injection=enabled
+helm install istio-ingress istio/gateway -n istio-ingress --wait
+```
+- собираем и пушим образы микросервисов в `https://hub.docker.com/u/nepetrov7`
+- устанавливаем CRD, добавляющую в кластер новый ресурс HelmRelease
+    - `kubectl apply -f https://raw.githubusercontent.com/fluxcd/helmoperator/master/deploy/flux-helm-release-crd.yaml`
+- устанавливаем flux
+```
+helm repo add fluxcd https://charts.fluxcd.io
+kubectl create namespace flux
+helm upgrade --install flux fluxcd/flux -f flux.values.yaml --namespace flux
+```
+- устаналиваем HelmOperator: `helm upgrade --install flux fluxcd/flux -f flux.values.yaml --namespace flux`
+- устаналиваем fluxctl: `sudo snap install fluxctl --classic`
+- получаем публичный ключ,  помощью которого flux получит доступ к нашему репозиторию `fluxctl identity --k8s-fwd-ns flux`
+- закидываем его в гитлаб
+- создаем файл в `deploy/namespaces`
+```
+cat ns_microservices-demo.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: microservices-demo
+```
+- после этого проверяем список ns
+```
+k get ns
+NAME                 STATUS   AGE
+default              Active   14d
+flux                 Active   23h
+istio-ingress        Active   23h
+istio-system         Active   23h
+kube-node-lease      Active   14d
+kube-public          Active   14d
+kube-system          Active   14d
+microservices-demo   Active   35s
+yandex-system        Active   14d
+```
+- видим что появился ns `microservices-demo`
+- видим строку лога в flux: `ts=2022-08-26T07:59:14.247774633Z caller=sync.go:608 method=Sync cmd="kubectl apply -f -" took=2.975094946s err=null output="namespace/microservices-demo created"`
+- создаем файл `deploy/releases/frontend.yaml`
+```
+apiVersion: helm.fluxcd.io/v1
+kind: HelmRelease
+metadata:
+  name: frontend
+  namespace: microservices-demo
+  annotations:
+    fluxcd.io/ignore: "false"
+    fluxcd.io/automated: "true"
+    flux.weave.works/tag.chart-image: semver:~v0.0
+spec:
+  releaseName: frontend
+  helmVersion: v3
+  chart:
+    git: git@gitlab.com:otus-petrov/microservices-demo.git
+    ref: master
+    path: deploy/charts/frontend
+  values:
+    image:
+      repository: nepetrov7/frontend
+      tag: v0.0.1
+```
+- пушим в мастер ветку и наблюдаем лог:
+```
+ts=2022-08-26T08:23:57.061086379Z caller=sync.go:608 method=Sync cmd="kubectl apply -f -" took=319.173767ms err=null output="helmrelease.helm.fluxcd.io/frontend created"
+ts=2022-08-26T08:23:57.06269242Z caller=daemon.go:701 component=daemon event="Sync: 1174cf1, microservices-demo:helmrelease/frontend" logupstream=false
+```
+- поды не появляются, смотрим `k -n microservices-demo describe helmreleases.helm.fluxcd.io frontend`
+```
+Events:
+  Type     Reason             Age                   From           Message
+  ----     ------             ----                  ----           -------
+  Warning  FailedReleaseSync  23m                   helm-operator  synchronization of release 'frontend' in namespace 'microservices-demo' failed: failed to prepare chart for release: chart not ready: no existing git mirror found
+  Warning  FailedReleaseSync  19m (x9 over 23m)     helm-operator  synchronization of release 'frontend' in namespace 'microservices-demo' failed: installation failed: template: frontend/templates/deployment.yaml:16:27: executing "frontend/templates/deployment.yaml" at <.Values.image.repository>: nil pointer evaluating interface {}.repository
+  Warning  FailedReleaseSync  3m40s (x32 over 19m)  helm-operator  synchronization of release 'frontend' in namespace 'microservices-demo' failed: installation failed: unable to build kubernetes objects from release manifest: unable to recognize "": no matches for kind "ServiceMonitor" in version "monitoring.coreos.com/v1"
+```
+- нам ServiceMonitor не требуется, поэтому удаляем его с `microservices-demo/deploy/charts/frontend/templates/serviceMonitor.yaml`
+```
+[user@localhost microservices-demo]$ k -n microservices-demo get po -w
+NAME                        READY   STATUS    RESTARTS   AGE
+frontend-786c99fbf9-9d6vg   0/1     Running   0          25s
+frontend-786c99fbf9-9d6vg   1/1     Running   0          26s
+```
+- frontend запустился
+
+#### HelmRelease
+- Аннотация разрешает автоматическое обновление релиза в Kubernetes кластере в случае изменения версии Docker образа в Registry
+- Указываем Flux следить за обновлениями конкретных Docker образов в Registry.
+    - Новыми считаются только образы, имеющие версию выше текущей и отвечающие маске семантического версионирования ~0.0 (например, 0.0.1, 0.0.72, но не 1.0.0)
+    - Helm chart, используемый для развертывания релиза. В нашем случае указываем git-репозиторий, и директорию с чартом внутри него
+    - Переопределяем переменные Helm chart. В дальнейшем Flux может сам переписывать эти значения и делать commit в git-репозиторий (например, изменять тег Docker образа при его обновлении в Registry)
+    -  подробнее по ссылке: `https://fluxcd.io/legacy/flux/references/helm-operator-integration/`
+- командой `fluxctl --k8s-fwd-ns flux sync` можно вручную запустить синхронизацию
+
+- проверяем, как отрабатывает маска
+```
+делаем изменения в Dockerfile
+docker build ./ -t nepetrov7/frontend:v0.0.2
+docker push nepetrov7/frontend:v0.0.2
+```
+- чуда не происходит, в логах видим сообщение. видимо проблема в docker hub
+ts=2022-09-06T09:06:30.622090027Z caller=repocachemanager.go:215 component=warmer canonical_name=index.docker.io/nepetrov7/frontend auth={map[]} warn="aborting image tag fetching due to rate limiting, will try again later"
+- пробуем закинуть образ в gitlab registry
+    - `docker login registry.gitlab.com`
+    - `docker build -t registry.gitlab.com/otus-petrov/frontend:v0.0.1 .`
+    - `docker push registry.gitlab.com/otus-petrov/frontend:v0.0.1`
+    - меняем ссылку на регистри и пушим в гитлаб
+    - собираем новые образ и пушим в регистри
+- видим что Automate image updates to Git отработал, задеплоил новую версию frontend
+```
+ts=2022-09-06T09:15:42.349701581Z caller=sync.go:608 method=Sync cmd="kubectl apply -f -" took=362.618485ms err=null output="namespace/microservices-demo unchanged\nhelmrelease.helm.fluxcd.io/frontend created"
+ts=2022-09-06T09:15:42.351015262Z caller=daemon.go:701 component=daemon event="Sync: 58ac75d, microservices-demo:helmrelease/frontend" logupstream=false
+ts=2022-09-06T10:56:28.726490538Z caller=daemon.go:701 component=daemon event="Sync: 861c770, microservices-demo:helmrelease/frontend" logupstream=false
+ts=2022-09-06T10:56:28.726529118Z caller=daemon.go:701 component=daemon event="Automated release of registry.gitlab.com/otus-petrov/frontend:v0.0.2" logupstream=false
+```
+- в гите добивился коммит с новым тегом frontend и сообщением [Auto-release registry.gitlab.com/otus-petrov/frontend:v0.0.2](https://gitlab.com/otus-petrov/microservices-demo/-/commit/861c77058d65d465bb33151ade9bf1d4f1687a34)
+
+
+#### проверяем как отрабытваются изменения в чарте
+- вносим обновление в helm chart, меняем имя deployment с frontend на frontend-hipster и пушим изменения в гит репозиторий
+- видим что деплой прошел успешно
+```
+[user@localhost microservices-demo]$ k -n microservices-demo get po -w
+NAME                        READY   STATUS    RESTARTS   AGE
+frontend-848cb89d7b-4fgb4   1/1     Running   1          21h
+frontend-hipster-848cb89d7b-gx26s   0/1     Pending   0          0s
+frontend-hipster-848cb89d7b-gx26s   0/1     Pending   0          1s
+frontend-hipster-848cb89d7b-gx26s   0/1     ContainerCreating   0          1s
+frontend-848cb89d7b-4fgb4           1/1     Terminating         1          21h
+frontend-848cb89d7b-4fgb4           0/1     Terminating         1          21h
+frontend-hipster-848cb89d7b-gx26s   0/1     Running             0          4s
+frontend-848cb89d7b-4fgb4           0/1     Terminating         1          21h
+frontend-848cb89d7b-4fgb4           0/1     Terminating         1          21h
+frontend-hipster-848cb89d7b-gx26s   1/1     Running             0          23s
+```
+- в логах flux видим что последжний коммит подтянулся и изменения в релизе изменились
+```
+ts=2022-09-07T08:43:01.600335238Z caller=loop.go:134 component=sync-loop event=refreshed url=ssh://git@gitlab.com/otus-petrov/microservices-demo.git branch=master HEAD=f22ff35c0848dd088554836640311bfa310d395f
+ts=2022-09-07T08:43:01.604270279Z caller=sync.go:64 component=daemon info="trying to sync git changes to the cluster" old=861c77058d65d465bb33151ade9bf1d4f1687a34 new=f22ff35c0848dd088554836640311bfa310d395f
+ts=2022-09-07T08:43:02.704847911Z caller=sync.go:542 method=Sync cmd=apply args= count=2
+ts=2022-09-07T08:43:03.029575999Z caller=sync.go:608 method=Sync cmd="kubectl apply -f -" took=324.665598ms err=null output="namespace/microservices-demo unchanged\nhelmrelease.helm.fluxcd.io/frontend unchanged"
+ts=2022-09-07T08:43:03.031071543Z caller=daemon.go:701 component=daemon event="Sync: f22ff35, no workloads changed" logupstream=false
+ts=2022-09-07T08:43:05.581876318Z caller=loop.go:236 component=sync-loop state="tag flux-sync" old=861c77058d65d465bb33151ade9bf1d4f1687a34 new=f22ff35c0848dd088554836640311bfa310d395f
+ts=2022-09-07T08:43:07.598697385Z caller=loop.go:134 component=sync-loop event=refreshed url=ssh://git@gitlab.com/otus-petrov/microservices-demo.git branch=master HEAD=f22ff35c0848dd088554836640311bfa310d395f
+```
+- в логах helm-operator видим сообщения:
+```
+ts=2022-09-07T08:42:53.930317169Z caller=helm.go:69 component=helm version=v3 info="Created a new Deployment called \"frontend-hipster\" in microservices-demo\n" targetNamespace=microservices-demo release=frontend
+ts=2022-09-07T08:42:54.097241437Z caller=helm.go:69 component=helm version=v3 info="Deleting \"frontend\" in microservices-demo..." targetNamespace=microservices-demo release=frontend
+ts=2022-09-07T08:42:54.128582848Z caller=helm.go:69 component=helm version=v3 info="updating status for upgraded release for frontend" targetNamespace=microservices-demo release=frontend
+ts=2022-09-07T08:42:54.213391495Z caller=release.go:364 component=release release=frontend targetNamespace=microservices-demo resource=microservices-demo:helmrelease/frontend helmVersion=v3 info="upgrade succeeded" revision=f22ff35c0848dd088554836640311bfa310d395f phase=upgrade
+ts=2022-09-07T08:43:22.60300946Z caller=release.go:79 component=release release=frontend targetNamespace=microservices-demo resource=microservices-demo:helmrelease/frontend helmVersion=v3 info="starting sync run"
+ts=2022-09-07T08:43:22.850226751Z caller=release.go:289 component=release release=frontend targetNamespace=microservices-demo resource=microservices-demo:helmrelease/frontend helmVersion=v3 info="running dry-run upgrade to compare with release version '3'" action=dry-run-compare
+ts=2022-09-07T08:43:22.853786152Z caller=helm.go:69 component=helm version=v3 info="preparing upgrade for frontend" targetNamespace=microservices-demo release=frontend
+ts=2022-09-07T08:43:22.85848751Z caller=helm.go:69 component=helm version=v3 info="resetting values to the chart's original version" targetNamespace=microservices-demo release=frontend
+ts=2022-09-07T08:43:24.04628256Z caller=helm.go:69 component=helm version=v3 info="performing update for frontend" targetNamespace=microservices-demo release=frontend
+```
+- делаем для всех микросервисов helmRelease
+- проверяем что все поды поднялись
+```
+[user@localhost switch_datacenter]$ k -n microservices-demo get po
+NAME                                     READY   STATUS             RESTARTS   AGE
+adservice-5547b9d9cd-7pqlc               1/1     Running            1          22h
+checkoutservice-5fb74cf7f8-p7fzn         1/1     Running            1          23h
+currencyservice-7c759466bd-jxhmk         0/1     CrashLoopBackOff   11         22h
+emailservice-6b94b5fd5d-h9jgv            1/1     Running            1          23h
+frontend-hipster-848cb89d7b-gx26s        1/1     Running            1          23h
+loadgenerator-55b9bcf9f8-5vb6d           0/1     Init:0/1           2          22h
+paymentservice-5c7d874b86-md6c6          0/1     CrashLoopBackOff   12         22h
+productcatalogservice-5b4d5f646b-779dd   1/1     Running            1          23h
+recommendationservice-5ff9cf6d5d-2qf4x   1/1     Running            2          23h
+shippingservice-688d4bd694-jmrmw         1/1     Running            1          23h
+```
+- видим в логах приложений currencyservice и paymentservice ошибку:`Error: Project ID must be specified in the configuration`
+- правим [так](https://gitlab.com/otus-petrov/microservices-demo/-/commit/a61eb1bdb44e9cd3b478e00eac9e22eae24b7c7c)
+- loadgenerator правим [так](https://gitlab.com/otus-petrov/microservices-demo/-/commit/58c0008f16ee957809ad0b5b38e6787c52e8b59d)
+- теперь loadgenerator ходит по имени сервиса на фронт, но все так же не стартует, так как фронт отдает 500, читаем логи frontend:
+```
+{"error":"could not retrieve cart: rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing dial tcp: lookup cartservice on 10.96.128.2:53: no such host\"","http.req.id":"2a8dff47-8ca3-452e-a189-22adc1ee7545","http.req.method":"GET","http.req.path":"/","message":"request error","session":"14c3a073-af07-49dc-a713-4fa68f921850","severity":"error","timestamp":"2022-09-08T12:02:54.142959984Z"}
+```
+- cartservice у нас не задеплоился по каким-то причинам, смотрим лог helm-operator
+```
+[user@localhost microservices-demo]$ k -n flux logs helm-operator-5d76686c9f-gq7qh | grep cartservice | tail -1
+ts=2022-09-08T12:08:07.328500714Z caller=release.go:85 component=release release=cartservice targetNamespace=microservices-demo resource=microservices-demo:helmrelease/cartservice helmVersion=v3 error="failed to prepare chart for release: no cached repository for helm-manager-1067d9c6027b8c3f27b49e40521d64be96ea412858d8e45064fa44afd3966ddc found. (try 'helm repo update'): open /root/.cache/helm/repository/helm-manager-1067d9c6027b8c3f27b49e40521d64be96ea412858d8e45064fa44afd3966ddc-index.yaml: no such file or directory"
+```
+- оказывается этот чарт сменил местоположение, [поправил](https://gitlab.com/otus-petrov/microservices-demo/-/commit/3a82ac4a0bc65155be90c348a37fcad862a67d76) и cartservice поднялся, а вместе с ним и loadgenerator
+```
+[user@localhost microservices-demo]$ k -n microservices-demo get po -w
+NAME                                     READY   STATUS    RESTARTS   AGE
+adservice-78c8f988d5-prz92               1/1     Running   2          24h
+checkoutservice-6b5ddbc-jl5nh            1/1     Running   1          24h
+currencyservice-5694d45d7-brp9q          1/1     Running   1          24h
+emailservice-6b94b5fd5d-t2brc            1/1     Running   2          24h
+frontend-hipster-6d4975dddc-nd5rj        1/1     Running   1          24h
+loadgenerator-6dfcfdb64-cwwp6            0/1     Running   0          21h
+paymentservice-5fdb8c59b9-cbxfj          1/1     Running   1          24h
+productcatalogservice-79985d5bbf-nktxv   1/1     Running   1          24h
+recommendationservice-568795f98f-lqfmq   1/1     Running   1          24h
+shippingservice-dc676b75c-s655s          1/1     Running   1          24h
+cartservice-redis-master-0               0/1     Pending   0          0s
+cartservice-redis-master-0               0/1     Pending   0          0s
+cartservice-bbd7df85c-zlch2              0/1     Pending   0          0s
+cartservice-bbd7df85c-zlch2              0/1     Pending   0          0s
+cartservice-redis-master-0               0/1     ContainerCreating   0          1s
+cartservice-bbd7df85c-zlch2              0/1     ContainerCreating   0          0s
+cartservice-bbd7df85c-zlch2              0/1     Running             0          7s
+cartservice-redis-master-0               0/1     Running             0          25s
+cartservice-bbd7df85c-zlch2              1/1     Running             0          28s
+cartservice-redis-master-0               1/1     Running             0          29s
+loadgenerator-6dfcfdb64-cwwp6            1/1     Running             0          21h
+```
+- в логе видим сообщения:
+```
+ts=2022-09-09T09:28:41.26715531Z caller=release.go:79 component=release release=cartservice targetNamespace=microservices-demo resource=microservices-demo:helmrelease/cartservice helmVersion=v3 info="starting sync run"
+ts=2022-09-09T09:28:48.253097502Z caller=release.go:313 component=release release=cartservice targetNamespace=microservices-demo resource=microservices-demo:helmrelease/cartservice helmVersion=v3 info="running installation" phase=install
+ts=2022-09-09T09:28:49.727073873Z caller=helm.go:69 component=helm version=v3 info="creating 7 resource(s)" targetNamespace=microservices-demo release=cartservice
+ts=2022-09-09T09:28:50.096423332Z caller=release.go:323 component=release release=cartservice targetNamespace=microservices-demo resource=microservices-demo:helmrelease/cartservice helmVersion=v3 info="installation succeeded" revision=3a82ac4a0bc65155be90c348a37fcad862a67d76 phase=install
+```
+- теперь все поды стартанули
+#### полезные команды flux
+- `export FLUX_FORWARD_NAMESPACE=flux` - переменная окружения, указывающая на namespace, в который установлен flux (альтернатива ключу `--k8s-fwd-ns <flux installation ns>`)
+- `fluxctl list-workloads -a` - посмотреть все workloads, которые находятся в зоне видимости flux
+- `fluxctl list-images -n microservices-demo` - посмотреть все Docker образы, используемые в кластере (в namespace microservicesdemo)
+- `fluxctl automate/deautomate` - включить/выключить автоматизацию управления workload
+- `fluxctl policy -w microservices-demo:helmrelease/frontend --tag-all='semver:~0.1'` - установить всем сервисам в workload microservices-demo:helmrelease/frontend политику обновления образов из Registry на базе семантического версионирования c маской 0.1.*
+- `fluxctl sync` - приндительно запустить синхронизацию состояния gitрепозитория с кластером
+- `fluxctl release --workload=microservices-demo:helmrelease/frontend --update-all-images` - принудительно инициировать сканирование Registry на предмет наличия свежих Docker образов
+
+### Canary deployments с Flagger и Istio
+- Flagger - оператор Kubernetes, созданный для автоматизации canary deployments.
+    - Flagger может использовать:
+        - Istio, Linkerd, App Mesh или nginx для маршрутизации трафика
+        - Prometheus для анализа канареечного релиза
+- установка istio
+    - устанавливаем по [инструкции](https://istio.io/latest/docs/setup/getting-started/)
+    - `kubectl label namespace microservices-demo istio-injection=enabled`
+- Установка Flagger
+    - `helm repo add flagger https://flagger.app`
+    - `kubectl apply -f https://raw.githubusercontent.com/weaveworks/flagger/master/artifacts/flagger/crd.yaml`
+```
+helm upgrade --install flagger flagger/flagger \
+--namespace=istio-system \
+--set crd.create=false \
+--set meshProvider=istio \
+--set metricsServer=http://prometheus:9090
+```
+- удаляем поды для добавления сайдкар контейнеров `kubectl delete pods --all -n microservices-demo`
+- проверяем что в каждом поде по 2 контейнера:
+```
+[user@localhost istio-1.15.0]$ k -n microservices-demo get po
+NAME                                     READY   STATUS    RESTARTS   AGE
+adservice-78c8f988d5-m8mt2               2/2     Running   0          81s
+cartservice-bbd7df85c-hcfqc              2/2     Running   0          81s
+cartservice-redis-master-0               2/2     Running   0          73s
+checkoutservice-6b5ddbc-vtchf            2/2     Running   0          80s
+currencyservice-5694d45d7-jc69g          2/2     Running   0          80s
+emailservice-6b94b5fd5d-dlhq9            2/2     Running   0          80s
+frontend-hipster-6d4975dddc-fzzjb        2/2     Running   0          80s
+loadgenerator-6dfcfdb64-hkcdt            2/2     Running   0          80s
+paymentservice-5fdb8c59b9-ltmts          2/2     Running   0          79s
+productcatalogservice-79985d5bbf-kdpkd   2/2     Running   0          79s
+recommendationservice-568795f98f-km4xr   2/2     Running   0          79s
+shippingservice-dc676b75c-cggpv          2/2     Running   0          79s
+```
+- На текущий момент у нас отсутствует ingress и мы не можем получить доступ к frontend снаружи кластера.
+- В то же время Istio в качестве альтернативы классическому ingress предлагает свой набор абстракций.
+- Чтобы настроить маршрутизацию трафика к приложению с использованием Istio, нам необходимо добавить ресурсы [VirtualService](https://istio.io/docs/concepts/traffic-management/#virtual-services) и [Gateway](https://istio.io/docs/concepts/traffic-management/#gateways)
+- настраиваем external ip
+```
+kubectl describe svc istio-ingressgateway -n istio-system
+Events:
+  Type     Reason                  Age                   From                Message
+  ----     ------                  ----                  ----                -------
+  Warning  SyncLoadBalancerFailed  47m (x10 over 92m)    service-controller  (combined from similar events): Error syncing load balancer: failed to ensure load balancer: failed to ensure cloud loadbalancer: failed to start cloud lb creation: request-id = 83e136b7-b747-43aa-a7e4-9dd6068346ab rpc error: code = PermissionDenied desc = Permission denied
+```
+- проблема в том что сервиный аккаунт не имеет прав на запрос внешнего IP
+- входим в yandex cloud console и [по инструкции](https://cloud.yandex.ru/docs/iam/operations/roles/grant) добавляем роль `load-balancer.admin` в сервисный аккаунт
+
+- проверяем теперь, получен ли externa IP
+```
+k -n istio-system get svc istio-ingressgateway 
+NAME                   TYPE           CLUSTER-IP     EXTERNAL-IP     PORT(S)                                                                      AGE
+istio-ingressgateway   LoadBalancer   10.96.167.95   51.250.102.98   15021:32330/TCP,80:31042/TCP,443:31302/TCP,31400:31340/TCP,15443:32294/TCP   24h
+```
+- создаем файл deploy/charts/fronntend/templates/canary.yaml
+- cannary не появляется, смоттрим лог helm-operator:
+```
+ts=2022-09-13T10:33:27.146258015Z caller=release.go:294 component=release release=frontend targetNamespace=microservices-demo resource=microservices-demo:helmrelease/frontend helmVersion=v3 error="dry-run upgrade for comparison failed: rendered manifests contain a resource that already exists. Unable to continue with update: Gateway \"frontend\" in namespace \"microservices-demo\" exists and cannot be imported into the current release: invalid ownership metadata; label validation error: missing key \"app.kubernetes.io/managed-by\": must be set to \"Helm\"; annotation validation error: missing key \"meta.helm.sh/release-name\": must be set to \"frontend\"; annotation validation error: missing key \"meta.helm.sh/release-namespace\": must be set to \"microservices-demo\"" phase=dry-run-compare
+```
+- проблема была в аннотациях и лейблах объектов, которые мы задеплоили изначально без использования helm
+- `k -n microservices-demo delete gateways.networking.istio.io frontend `
+- `k -n microservices-demo delete virtualservices.networking.istio.io frontend `
+- проверим что flagger инициализировал ресурс canary `frontend`
+```
+[user@localhost microservices-demo]$ k -n microservices-demo get canary
+NAME       STATUS         WEIGHT   LASTTRANSITIONTIME
+frontend   Initializing   0        2022-09-14T07:56:03Z
+```
+- проверим что flagger обновил pod, добавив ему к названию постфикс `primary`
+```
+[user@localhost microservices-demo]$ k -n microservices-demo get po -l  app=frontend-primary
+No resources found in microservices-demo namespace.
+```
+- смотрим лог flagger
+```
+[user@localhost microservices-demo]$ k -n istio-system logs flagger-74ccdbd495-j9p8h --tail 1
+{"level":"info","ts":"2022-09-14T08:12:07.767Z","caller":"controller/events.go:45","msg":"deployment frontend.microservices-demo get query error: deployments.apps \"frontend\" not found","canary":"frontend.microservices-demo"}
+```
+- видим что он ищет deployment `frontend`, но мы ведь его переименовали (не понятно зачем, вопрос к преподавателю) [правим](https://gitlab.com/otus-petrov/microservices-demo/-/commit/f4900d424af5b30bf0be1c4428d579a6780100c7)
+
+```
+[user@localhost microservices-demo]$ k -n microservices-demo get po -l app=frontend-primary
+NAME                                        READY   STATUS    RESTARTS   AGE
+frontend-hipster-primary-6cc5ddd74f-z6j2t   2/2     Running   0          2m3s
+```
+
+- собираем новый образ фронта и пушим его
+- `docker build ./ -t registry.gitlab.com/otus-petrov/frontend:v0.0.3`
+- `docker push registry.gitlab.com/otus-petrov/frontend:v0.0.3`
+- ставим prometheus
+- `helm install prometheus -n istio-system prometheus-community/prometheus`
+- сморим describe canary frontend
+
+```
+kubectl get canaries -n microservices-demo
+NAME       STATUS      WEIGHT   LASTTRANSITIONTIME
+frontend   Succeeded   0        2022-09-16T10:41:26Z
+
+ Warning  Synced  33m                flagger  frontend-primary.microservices-demo not ready: waiting for rollout to finish: observed deployment generation less than desired generation
+  Normal   Synced  32m (x2 over 33m)  flagger  all the metrics providers are available!
+  Normal   Synced  32m                flagger  Initialization done! frontend.microservices-demo
+  Normal   Synced  29m                flagger  New revision detected! Scaling up frontend.microservices-demo
+  Normal   Synced  28m                flagger  Starting canary analysis for frontend.microservices-demo
+  Normal   Synced  28m                flagger  Advance frontend.microservices-demo canary weight 10
+  Normal   Synced  27m                flagger  Advance frontend.microservices-demo canary weight 20
+  Normal   Synced  26m                flagger  Advance frontend.microservices-demo canary weight 30
+  Normal   Synced  25m                flagger  Copying frontend.microservices-demo template spec to frontend-primary.microservices-demo
+  Normal   Synced  24m                flagger  Routing all traffic to primary
+  Normal   Synced  23m                flagger  (combined from similar events): Promotion completed! Scaling down frontend.microservices-demo
+```
+ссылка на репозиторий: `https://gitlab.com/otus-petrov/microservices-demo/-/tree/master`
