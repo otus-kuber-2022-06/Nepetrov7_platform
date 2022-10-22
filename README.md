@@ -1275,3 +1275,33 @@ frontend   Succeeded   0        2022-09-16T10:41:26Z
   Normal   Synced  23m                flagger  (combined from similar events): Promotion completed! Scaling down frontend.microservices-demo
 ```
 ссылка на репозиторий: `https://gitlab.com/otus-petrov/microservices-demo/-/tree/master`
+
+### kubernetes-debug
+- воспроизводим проблему:
+    - k run nginx --image=nginx
+    - k debug nginx -it --image=nicolaka/netshoot --copy-to=test-nginx
+```
+        test-nginx  ~  strace -c -p1
+        strace: attach: ptrace(PTRACE_SEIZE, 1): Operation not permitted
+```
+- по логике агента kubectl-debug - он [выставляет](https://github.com/aylei/kubectl-debug/blob/5364033c9ff968c956e2db896a9f1a57f034ed86/pkg/agent/runtime.go#L152) нужные capabilities при создании debug-контейнеров
+- устанавливаем kubectl-debug в кластер
+    - качаем [бинарь](https://github.com/aylei/kubectl-debug/releases)
+    - ставим [агент](https://raw.githubusercontent.com/aylei/kubectl-debug/dd7e4965e4ae5c4f53e6cf9fd17acc964274ca5c/scripts/agent_daemonset.yml) в кластер, для моего кластера приглось подправить ApiVersion, приложил манифест в директорию с ДЗ
+- проверяем:
+```
+ test-nginx  ~  strace -c -p1
+strace: Process 1 attached
+```
+### iptables-tailer
+- Он предназначен для того, чтобы выводить информацию об отброшенных iptables пакетах в журнал событий Kubernetes ( kubectl get events )
+- Основной кейс - сообщить разработчикам сервисов о проблемах с NetworkPolicy
+- устаналиваем calico
+    - `helm repo add projectcalico https://projectcalico.docs.tigera.io/charts`
+    - `helm show values projectcalico/tigera-operator --version v3.24.1`
+    - `kubectl create namespace tigera-operator`
+    - `helm install calico projectcalico/tigera-operator --version v3.24.1 --namespace tigera-operator`
+- берем тестовое [приложение](https://github.com/piontec/netperf-operator)и деплооим его в куб, манифесты для деплоя в директории kit
+    - манифесты из репозитория сильно устарели, пришлось дописать их под новую версию kubernetes, в том числе и схему в crd, но netperf-operator все еще сыпет ошибками:
+    - `ERROR: logging before flag.Parse: E1019 11:15:22.728045       1 reflector.go:205] github.com/piontec/netperf-operator/vendor/github.com/operator-framework/operator-sdk/pkg/sdk/informer.go:80: Failed to list *unstructured.Unstructured: the server could not find the requested resource (get netperfs.app.example.com)`
+    - role netperf-operator наделил всеми возможными правами, но под netperf-operator все еще не видит ресурсы netperfs в неймспейсе.
