@@ -1305,3 +1305,236 @@ strace: Process 1 attached
     - манифесты из репозитория сильно устарели, пришлось дописать их под новую версию kubernetes, в том числе и схему в crd, но netperf-operator все еще сыпет ошибками:
     - `ERROR: logging before flag.Parse: E1019 11:15:22.728045       1 reflector.go:205] github.com/piontec/netperf-operator/vendor/github.com/operator-framework/operator-sdk/pkg/sdk/informer.go:80: Failed to list *unstructured.Unstructured: the server could not find the requested resource (get netperfs.app.example.com)`
     - role netperf-operator наделил всеми возможными правами, но под netperf-operator все еще не видит ресурсы netperfs в неймспейсе.
+
+## kubeadm
+- развернем кластер с помошью kubeadm
+    - развернул 5 машин (centos7) в vmware
+    - отключил swap
+    - `yum install apt-transport-https ca-certificates curl software-properties-common gnupg2 -y`
+    - `sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo`
+    - `sudo yum install docker-ce docker-ce-cli containerd.io docker-compose-plugin -y`
+    - 
+    ```
+        sudo tee /etc/yum.repos.d/kubernetes.repo<<EOF
+        [kubernetes]
+        name=Kubernetes
+        baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+        enabled=1
+        gpgcheck=1
+        repo_gpgcheck=1
+        gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+        EOF
+    ```
+    - `sudo setenforce 0`
+    - `sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config`
+    - ищем последнюю патч версию kubeadm: `yum --showduplicates list kubeadm`
+    - устанавлииваем на все машины: `sudo yum install kubeadm-1.17.17-0 kubectl-1.17.17-0 kubelet-1.17.17-0 kubernetes-cni -y`
+    - настраиваем sysctl
+        ```
+        sudo modprobe overlay
+        sudo modprobe br_netfilter
+
+        sudo tee /etc/sysctl.d/kubernetes.conf<<EOF
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.bridge.bridge-nf-call-iptables = 1
+        net.ipv4.ip_forward = 1
+        EOF
+
+        sudo sysctl --system
+        ```
+    - выбираем в качестве Container runtime - Docker
+        ```
+        # Install packages
+        sudo yum install -y yum-utils device-mapper-persistent-data lvm2
+        sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        sudo yum install docker-ce-19.03.0 docker-ce-cli containerd.io
+
+        # Create required directories
+        sudo mkdir /etc/docker
+        sudo mkdir -p /etc/systemd/system/docker.service.d
+
+        # Create daemon json config file
+        sudo tee /etc/docker/daemon.json <<EOF
+        {
+        "exec-opts": ["native.cgroupdriver=systemd"],
+        "log-driver": "json-file",
+        "log-opts": {
+            "max-size": "100m"
+        },
+        "storage-driver": "overlay2",
+        "storage-opts": [
+            "overlay2.override_kernel_check=true"
+        ]
+        }
+        EOF
+
+        # Start and enable Services
+        sudo systemctl daemon-reload 
+        sudo systemctl restart docker
+        sudo systemctl enable docker
+        ```
+    - либо выключаем firewalld `sudo systemctl disable --now firewalld`
+    - либо включаем порты:
+        - на мастерах:
+            - `sudo firewall-cmd --add-port={6443,2379-2380,10250,10251,10252,5473,179,5473}/tcp --permanent`
+            - `sudo firewall-cmd --add-port={4789,8285,8472}/udp --permanent`
+            - `sudo firewall-cmd --reload`
+        - на воркер нодах
+            - `sudo firewall-cmd --add-port={10250,30000-32767,5473,179,5473}/tcp --permanent`
+            - `sudo firewall-cmd --add-port={4789,8285,8472}/udp --permanent`
+            - `sudo firewall-cmd --reload`
+    - заходим на мастер ноды и проверяем что `br_netfilter` загружен: `lsmod | grep br_netfilter`
+    - запускаем kubelet `sudo systemctl enable kubelet`
+    - пулим все необходимые образы `sudo kubeadm config images pull`
+    - прописываем hosts на все машины
+        ```
+        cat > /etc/hosts
+        127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+        ::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+
+        172.16.5.181    kube181-dc2.dev.test kube181-dc2
+        172.16.5.182    kube182-dc2.dev.test kube182-dc2
+        172.16.5.183    kube183-dc2.dev.test kube183-dc2
+        172.16.5.184    kube184-dc2.dev.test kube184-dc2
+        172.16.5.185    kube185-dc2.dev.test kube185-dc2
+        ```
+    - инициализируем кластер
+        ```
+        sudo kubeadm init \
+        --pod-network-cidr=192.168.0.0/16 \
+        --upload-certs \
+        --control-plane-endpoint=172.16.5.181
+        ```
+    - на каждой мастер ноде выполняем команду
+        ```
+        kubeadm join 172.16.5.181:6443 --token a0r7b2.rel5vzgorhjmy7fm \
+            --discovery-token-ca-cert-hash sha256:367affe8a81349198dc1739c785356016dcdb9113bf8fcdbaa683ea935af1383 \
+            --control-plane --certificate-key 3c98fc3f12fafbbea7d6b40431899629513c28c23394efd26d9c8902a78026c0
+        ```
+    - на каждой воркер ноде выполняем команду
+        ```
+        kubeadm join 172.16.5.181:6443 --token a0r7b2.rel5vzgorhjmy7fm \
+            --discovery-token-ca-cert-hash sha256:367affe8a81349198dc1739c785356016dcdb9113bf8fcdbaa683ea935af1383 
+        ```
+    - ставим сетевой плагин caliko:
+        - `kubectl create -f https://docs.projectcalico.org/manifests/tigera-operator.yaml`
+        - `kubectl create -f https://docs.projectcalico.org/manifests/custom-resources.yaml`
+    - видим что ноды в статусе notReady, смотрим describe и видим в нодах ошибку: `runtime network not ready: NetworkReady=false reason:NetworkPluginNotReady message:docker: network plugin is not ready: cni config uninitialized`
+        - удаляем calico.
+        - ставим flannel`kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/2140ac876ef134e0ed5af15c65e414cf26827915/Documentation/kube-flannel.yml`
+        - теперь ноды стали Ready
+    - `kubeadm token list` посмотреть токены
+    - получить хеш - `openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'`
+    - k get no
+        ```
+        NAME          STATUS   ROLES    AGE   VERSION
+        kube181-dc2   Ready    master   22h   v1.17.17
+        kube182-dc2   Ready    master   22h   v1.17.17
+        kube183-dc2   Ready    master   22h   v1.17.17
+        kube184-dc2   Ready    <none>   22h   v1.17.17
+        kube185-dc2   Ready    <none>   22h   v1.17.17
+        ```
+    - для демонстрации работты кластера запускаем nginx
+        ```
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+        name: nginx-deployment
+        spec:
+        selector:
+            matchLabels:
+            app: nginx
+        replicas: 4
+        template:
+            metadata:
+            labels:
+                app: nginx
+            spec:
+            containers:
+                - name: nginx
+                image: nginx:1.17.2
+                ports:
+                    - containerPort: 80
+        ```
+    - проверяем поднялись лии они
+        ```
+        k get po 
+        NAME                               READY   STATUS    RESTARTS   AGE
+        nginx-deployment-c8fd555cc-27fxd   1/1     Running   0          106s
+        nginx-deployment-c8fd555cc-q7rc5   1/1     Running   0          106s
+        nginx-deployment-c8fd555cc-v67bh   1/1     Running   0          106s
+        nginx-deployment-c8fd555cc-x59hb   1/1     Running   0          106s
+        ```
+- Допускается, отставание версий worker-нод от master, но не наоборот. Поэтому обновление будем начинать с master-нод
+    - смотрим следующую минорную версию с самой высокой патч версией и ставим ее
+        - `yum --showduplicates list kubelet`
+        - `sudo yum install kubeadm-1.18.20-0 kubectl-1.18.20-0 kubelet-1.18.20-0 -y`
+    - проверяем обновилась ли версия kubelet`kubectl get no`
+        - не обновилась - поэтому запускаем `systemctl daemon-reload`, затем `systemctl restart kubelet`
+        - теперь обновилась
+            ```
+            [root@kube181-dc2 ~]# kubectl get no
+            NAME          STATUS   ROLES    AGE   VERSION
+            kube181-dc2   Ready    master   24h   v1.18.20
+            kube182-dc2   Ready    master   24h   v1.17.17
+            kube183-dc2   Ready    master   24h   v1.17.17
+            kube184-dc2   Ready    <none>   24h   v1.17.17
+            kube185-dc2   Ready    <none>   24h   v1.17.17
+            ```
+    - обновляем таким же образом все мастер ноды
+    - смоттрим какие изменения собирается сделать kubeadm
+        ```
+        [root@kube181-dc2 ~]# kubeadm upgrade plan
+        [upgrade/config] Making sure the configuration is correct:
+        [upgrade/config] Reading configuration from the cluster...
+        [upgrade/config] FYI: You can look at this config file with 'kubectl -n kube-system get cm kubeadm-config -oyaml'
+        [preflight] Running pre-flight checks.
+        [upgrade] Running cluster health checks
+        [upgrade] Fetching available versions to upgrade to
+        [upgrade/versions] Cluster version: v1.17.17
+        [upgrade/versions] kubeadm version: v1.18.20
+        I1109 14:13:08.632139   16913 version.go:255] remote version is much newer: v1.25.3; falling back to: stable-1.18
+        [upgrade/versions] Latest stable version: v1.18.20
+        [upgrade/versions] Latest stable version: v1.18.20
+        [upgrade/versions] Latest version in the v1.17 series: v1.17.17
+        [upgrade/versions] Latest version in the v1.17 series: v1.17.17
+
+        Components that must be upgraded manually after you have upgraded the control plane with 'kubeadm upgrade apply':
+        COMPONENT   CURRENT        AVAILABLE
+        Kubelet     2 x v1.17.17   v1.18.20
+                    3 x v1.18.20   v1.18.20
+
+        Upgrade to the latest stable version:
+
+        COMPONENT            CURRENT    AVAILABLE
+        API Server           v1.17.17   v1.18.20
+        Controller Manager   v1.17.17   v1.18.20
+        Scheduler            v1.17.17   v1.18.20
+        Kube Proxy           v1.17.17   v1.18.20
+        CoreDNS              1.6.5      1.6.7
+        Etcd                 3.4.3      3.4.3-0
+
+        You can now apply the upgrade by executing the following command:
+
+                kubeadm upgrade apply v1.18.20
+
+        _____________________________________________________________________
+        ```
+    - обновляем все master-ноды: `kubeadm upgrade apply v1.18.20 -y`
+    - проверяем все ли обновилось
+        ```
+        [root@kube181-dc2 ~]# kubeadm version
+        kubeadm version: &version.Info{Major:"1", Minor:"18", GitVersion:"v1.18.20", GitCommit:"1f3e19b7beb1cc0110255668c4238ed63dadb7ad", GitTreeState:"clean", BuildDate:"2021-06-16T12:56:41Z", GoVersion:"go1.13.15", Compiler:"gc", Platform:"linux/amd64"}
+        [root@kube181-dc2 ~]# kubelet --version
+        Kubernetes v1.18.20
+        [root@kube181-dc2 ~]# kubectl version
+        Client Version: version.Info{Major:"1", Minor:"18", GitVersion:"v1.18.20", GitCommit:"1f3e19b7beb1cc0110255668c4238ed63dadb7ad", GitTreeState:"clean", BuildDate:"2021-06-16T12:58:51Z", GoVersion:"go1.13.15", Compiler:"gc", Platform:"linux/amd64"}
+        Server Version: version.Info{Major:"1", Minor:"18", GitVersion:"v1.18.20", GitCommit:"1f3e19b7beb1cc0110255668c4238ed63dadb7ad", GitTreeState:"clean", BuildDate:"2021-06-16T12:51:17Z", GoVersion:"go1.13.15", Compiler:"gc", Platform:"linux/amd64"}
+        [root@kube181-dc2 ~]# kubectl -n kube-system describe po kube-apiserver-kube181-dc2 | grep Image: 
+            Image:         k8s.gcr.io/kube-apiserver:v1.18.20
+        ```
+- обновляем worker-node
+    - выводим ноду из планирования `kubectl drain $nodename`
+    - ставим пакеты `sudo yum install kubeadm-1.18.20-0 kubectl-1.18.20-0 kubelet-1.18.20-0 -y`
+    - рестартуем kubelet `systemctl daemon-reload & systemctl restart kubelet`
+- готово
